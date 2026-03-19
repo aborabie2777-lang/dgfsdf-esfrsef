@@ -772,8 +772,11 @@ async function checkDeposits() {
       const currentBamboo    = userData.bamboo || 0;
       const newBambooBalance = currentBamboo + bambooEarned;
 
-      // تحديث رصيد البامبو
-      await db.ref(`users/${userId}`).update({ bamboo: newBambooBalance });
+      // تحديث رصيد البامبو + تعليم المستخدم كمودع
+      await db.ref(`users/${userId}`).update({
+        bamboo:       newBambooBalance,
+        hasDeposited: true,
+      });
 
       // تسجيل بيانات الإيداع
       const txLink           = `https://tonscan.org/tx/${encodeURIComponent(txHash)}`;
