@@ -413,14 +413,27 @@ async function validateWithdrawal(withdrawId, data) {
   }
 
   // ==========================
-  // 🔹 فحص hasDeposited — رفض السحوبات > 0.02 TON بدون إيداع
+  // 🔹 فحص hasDeposited — رفض السحوبات بدون إيداع
   // ==========================
-  if (userId && roundedAmount > 0.02) {
+  if (userId && !data.approvedByAdmin) {
     let hasDeposited = false;
     try {
-      const depSnap = await db.ref(`users/${userId}/hasDeposited`).once("value");
-      hasDeposited = depSnap.val() === true;
-    } catch (e) { console.log(`⚠️ hasDeposited check error: ${e.message}`); }
+      // فحص مزدوج: الـ flag + الـ deposits node مباشرة
+      const [flagSnap, depositsSnap] = await Promise.all([
+        db.ref(`users/${userId}/hasDeposited`).once("value"),
+        db.ref(`users/${userId}/deposits`).once("value"),
+      ]);
+      const flagTrue = flagSnap.val() === true;
+      const depositsData = depositsSnap.val() || {};
+      const confirmedDeposits = Object.values(depositsData).filter(d => !d.status || d.status !== 'pending');
+      const hasRealDeposit = confirmedDeposits.length > 0;
+      hasDeposited = flagTrue || hasRealDeposit;
+      if (!flagTrue && hasRealDeposit) {
+        // صحح الـ flag إذا كان ناقص
+        await db.ref(`users/${userId}`).update({ hasDeposited: true }).catch(() => {});
+        console.log(`🔧 Fixed missing hasDeposited flag for user ${userId}`);
+      }
+    } catch (e) { console.log(`⚠️ hasDeposited check error: ${e.message}`); hasDeposited = true; }
 
     if (!hasDeposited) {
       console.log(`🚫 No-deposit rejection: user ${userId} | ${roundedAmount} TON`);
@@ -514,7 +527,7 @@ async function validateWithdrawal(withdrawId, data) {
 
       const projectedTotal = totalPaidTon + roundedAmount;
 
-      if (totalDepositTon > 0 && projectedTotal > totalDepositTon) {
+      if (projectedTotal > totalDepositTon) {
         console.log(`⚠️ Withdrawals exceed deposits: user ${userId} | deposited=${totalDepositTon.toFixed(3)} | paid+this=${projectedTotal.toFixed(3)}`);
         await db.ref(`withdrawQueue/${withdrawId}`).update({
           status: "awaiting_approval",
@@ -523,19 +536,22 @@ async function validateWithdrawal(withdrawId, data) {
         });
 
         const requestTime = new Date(data.ts || Date.now()).toLocaleString('en-GB', { timeZone: 'UTC', hour12: false });
+        const zeroDeposit = totalDepositTon === 0;
         const warningText =
-          `⚠️ <b>سحب يحتاج موافقة — تجاوز الإيداعات</b>\n\n` +
+          `⚠️ <b>سحب يحتاج موافقة — ${zeroDeposit ? 'لا يوجد إيداع' : 'تجاوز الإيداعات'}</b>\n\n` +
           `👤 User: <code>${userId}</code>\n` +
           `━━━━━━━━━━━━━━━━\n` +
           `🆔 ID: <code>${withdrawId}</code>\n` +
           `💰 المبلغ المطلوب: <b>${roundedAmount} TON</b>\n` +
-          `📥 إجمالي الإيداعات: <b>${totalDepositTon.toFixed(3)} TON</b>\n` +
+          `📥 إجمالي الإيداعات: <b>${zeroDeposit ? '❌ لا يوجد إيداع' : totalDepositTon.toFixed(3) + ' TON'}</b>\n` +
           `📤 إجمالي السحوبات المدفوعة: <b>${totalPaidTon.toFixed(3)} TON</b>\n` +
           `📊 المتوقع بعد الدفع: <b>${projectedTotal.toFixed(3)} TON</b>\n` +
           `📬 المحفظة:\n<code>${data.address}</code>\n` +
           `🕐 الوقت: ${requestTime} UTC\n` +
           `━━━━━━━━━━━━━━━━\n\n` +
-          `⚠️ إجمالي السحوبات سيتجاوز الإيداعات! هل توافق؟`;
+          (zeroDeposit
+            ? `🚨 هذا المستخدم لم يودع أي مبلغ! هل توافق على السحب؟`
+            : `⚠️ إجمالي السحوبات سيتجاوز الإيداعات! هل توافق؟`);
 
         const botToken = process.env.TELEGRAM_BOT_TOKEN;
         if (botToken) {
@@ -1109,7 +1125,8 @@ function startWelcomeBot() {
       `/addbamboo [userId] [كمية] — إضافة Bamboo لمستخدم\n\n` +
       `🕵️ <b>كشف التلاعب</b>\n` +
       `/check_suspicious — كشف محافظ مشتركة (+3 مستخدمين)\n` +
-      `/reject_suspicious — رفض وحظر جميع المشبوهين\n\n` +
+      `/reject_suspicious — رفض وحظر جميع المشبوهين\n` +
+      `/check_nodeposit — كشف مستخدمين سحبوا بدون إيداع\n\n` +
       `⏳ <b>الحد اليومي</b>\n` +
       `/awaiting_queue — قائمة السحوبات المعلقة بالحد اليومي\n` +
       `/unlock [عدد] — تحرير عدد محدد من السحوبات المعلقة للدفع\n`
@@ -1514,7 +1531,63 @@ function startWelcomeBot() {
     } catch(e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
   });
 
-  // ─── /lastpaid ────────────────────────────────────────
+  // ─── /check_nodeposit ─────────────────────────────────
+  bot.onText(/\/check_nodeposit/, async (msg) => {
+    if (!isAdmin(msg)) { await unauth(msg); return; }
+    try {
+      await adminReply(bot, msg.chat.id, "🔍 جاري فحص جميع السحوبات المدفوعة...");
+      const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("paid").once("value");
+      const items = snap.val();
+      if (!items) { await adminReply(bot, msg.chat.id, "📭 لا توجد سحوبات مدفوعة"); return; }
+
+      // جمع كل المستخدمين الفريدين مع إجمالي سحوباتهم
+      const userMap = {};
+      Object.values(items).forEach(d => {
+        if (!d.userId) return;
+        if (!userMap[d.userId]) userMap[d.userId] = { totalPaid: 0, count: 0 };
+        userMap[d.userId].totalPaid += roundAmount(d.ton);
+        userMap[d.userId].count++;
+      });
+
+      // فحص كل مستخدم — هل عنده إيداع؟
+      await adminReply(bot, msg.chat.id, `👥 ${Object.keys(userMap).length} مستخدم فريد — جاري فحص الإيداعات...`);
+
+      const noDepositUsers = [];
+      for (const [userId, info] of Object.entries(userMap)) {
+        try {
+          const [flagSnap, depositsSnap] = await Promise.all([
+            db.ref(`users/${userId}/hasDeposited`).once("value"),
+            db.ref(`users/${userId}/deposits`).once("value"),
+          ]);
+          const flagTrue   = flagSnap.val() === true;
+          const depositsData = depositsSnap.val() || {};
+          const confirmed  = Object.values(depositsData).filter(d => !d.status || d.status !== 'pending');
+          const hasDeposit = flagTrue || confirmed.length > 0;
+          if (!hasDeposit) noDepositUsers.push({ userId, ...info });
+        } catch (e) { /* تجاهل الأخطاء الفردية */ }
+      }
+
+      if (!noDepositUsers.length) {
+        await adminReply(bot, msg.chat.id, "✅ <b>لا يوجد مستخدمون سحبوا بدون إيداع</b>");
+        return;
+      }
+
+      noDepositUsers.sort((a, b) => b.totalPaid - a.totalPaid);
+      let text = `🚨 <b>مستخدمون سحبوا بدون إيداع (${noDepositUsers.length})</b>\n${'━'.repeat(30)}\n\n`;
+      const CHUNK = 20;
+      for (let i = 0; i < noDepositUsers.length; i += CHUNK) {
+        const chunk = noDepositUsers.slice(i, i + CHUNK);
+        text = i === 0
+          ? `🚨 <b>مستخدمون سحبوا بدون إيداع (${noDepositUsers.length})</b>\n${'━'.repeat(30)}\n\n`
+          : `🚨 <b>تابع... (${i + 1}–${Math.min(i + CHUNK, noDepositUsers.length)})</b>\n\n`;
+        chunk.forEach((u, idx) => {
+          text += `${i + idx + 1}. 👤 <code>${u.userId}</code> — <b>${u.totalPaid.toFixed(3)} TON</b> (${u.count} سحب)\n`;
+        });
+        await adminReply(bot, msg.chat.id, text);
+        if (i + CHUNK < noDepositUsers.length) await new Promise(r => setTimeout(r, 400));
+      }
+    } catch(e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
+  });
   bot.onText(/\/lastpaid/, async (msg) => {
     if (!isAdmin(msg)) { await unauth(msg); return; }
     try {
