@@ -415,6 +415,7 @@ async function validateWithdrawal(withdrawId, data) {
     return { valid: false, skip: true };
   }
 
+
   // ── فحص الإيداع: لو المبلغ > 0.02 TON والمستخدم لم يودع → رفض فوري ──
   if (userId && roundedAmount > 0.02) {
     try {
@@ -424,61 +425,54 @@ async function validateWithdrawal(withdrawId, data) {
       if (!hasDeposited) {
         console.log(`🚫 No-deposit rejection [${withdrawId}] user=${userId} amount=${roundedAmount} TON`);
 
+        // رجّع الـ coins للمستخدم
         const coinsToRefund = Number(data.amt || 0);
         if (coinsToRefund > 0) {
           await db.ref(`users/${userId}/coins`).transaction(cur => (cur || 0) + coinsToRefund);
           console.log(`↩️ Refunded ${coinsToRefund} coins to user ${userId}`);
         }
 
+        // حدّث حالة السحب
         await db.ref(`withdrawQueue/${withdrawId}`).update({
-          status: 'cancelled',
-          error: 'Rejected: no deposit on record — withdrawal above 0.02 TON requires at least one prior deposit.',
+          status:    'cancelled',
+          error:     'Rejected: no deposit on record — withdrawal above 0.02 TON requires at least one prior deposit.',
           updatedAt: Date.now(),
         });
 
+        // حدّث wdHistory
         if (wdId) {
-          await db.ref(`users/${userId}/wdHistory/${wdId}`).update({ status: 'cancelled', updatedAt: Date.now() }).catch(() => {});
+          await db.ref(`users/${userId}/wdHistory/${wdId}`).update({
+            status: 'cancelled', updatedAt: Date.now(),
+          }).catch(() => {});
         }
 
+        // رسالة للمستخدم
         const botToken = process.env.TELEGRAM_BOT_TOKEN;
         if (botToken && data.chatId) {
           await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              chat_id: data.chatId,
+              chat_id:    data.chatId,
               parse_mode: 'HTML',
               text:
-                `❌ <b>Withdrawal Rejected</b>
-
-` +
-                `Your withdrawal request of <b>${roundedAmount} TON</b> has been rejected.
-
-` +
-                `<b>Reason:</b> No deposit found on your account.
-` +
-                `Withdrawals above <b>0.02 TON</b> require at least one prior deposit to the bot.
-
-` +
-                `✅ Your coins (<b>${coinsToRefund.toLocaleString()}</b>) have been returned to your balance.
-
-` +
+                `❌ <b>Withdrawal Rejected</b>\n\n` +
+                `Your withdrawal of <b>${roundedAmount} TON</b> has been rejected.\n\n` +
+                `<b>Reason:</b> No deposit found on your account.\n` +
+                `Withdrawals above <b>0.02 TON</b> require at least one prior deposit.\n\n` +
+                `✅ Your coins (<b>${coinsToRefund.toLocaleString()}</b>) have been returned to your balance.\n\n` +
                 `Please make a deposit first, then try again. 🐼`,
             }),
           }).catch(() => {});
         }
 
+        // إشعار الأدمن
         if (botInstance) {
           await botInstance.sendMessage(ADMIN_CHAT_ID,
-            `🚫 <b>سحب مرفوض — لا يوجد إيداع</b>
-
-` +
-            `👤 User: <code>${userId}</code>
-` +
-            `🆔 ID: <code>${withdrawId}</code>
-` +
-            `💰 المبلغ: <b>${roundedAmount} TON</b>
-` +
+            `🚫 <b>سحب مرفوض — لا يوجد إيداع</b>\n\n` +
+            `👤 User: <code>${userId}</code>\n` +
+            `🆔 ID: <code>${withdrawId}</code>\n` +
+            `💰 المبلغ: <b>${roundedAmount} TON</b>\n` +
             `↩️ تم إعادة: <b>${coinsToRefund.toLocaleString()} coins</b>`,
             { parse_mode: 'HTML' }
           ).catch(() => {});
@@ -1051,7 +1045,7 @@ function startWelcomeBot() {
 
       `🕵️ <b>كشف التلاعب</b>\n` +
       `/check_suspicious — كشف محافظ مشتركة (+3 مستخدمين)\n` +
-      `/reject_suspicious — رفض وحظر جميع المشبوهين\n\n` +
+      `/reject_suspicious — رفض وحظر جميع المشبوهين\n` +
 
       `⏳ <b>إدارة الحد اليومي</b>\n` +
       `/awaiting_queue — عرض السحوبات المعلقة بسبب الحد اليومي + إجمالي التون\n` +
@@ -1695,18 +1689,14 @@ function startWelcomeBot() {
     } catch (e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
   });
 
+
   // ─── /awaiting_queue ──────────────────────────────────
-  // يعرض السحوبات المعلقة بسبب الحد اليومي مع إجمالي التون
   bot.onText(/\/awaiting_queue/, async (msg) => {
     if (!isAdmin(msg)) { await unauth(msg); return; }
     try {
       const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("awaiting_approval").once("value");
       const items = snap.val();
-
-      if (!items) {
-        await adminReply(bot, msg.chat.id, "📭 لا توجد سحوبات في انتظار الحد اليومي");
-        return;
-      }
+      if (!items) { await adminReply(bot, msg.chat.id, "📭 لا توجد سحوبات في انتظار الحد اليومي"); return; }
 
       const list = Object.entries(items)
         .map(([id, d]) => ({ id, ...d }))
@@ -1736,10 +1726,7 @@ function startWelcomeBot() {
             `   🕐 ${time} UTC\n\n`;
         });
 
-        if (i === 0) {
-          text += `\n💡 لفك انتظار عدد منها:\n<code>/unlock [عدد]</code>\nمثال: <code>/unlock 100</code>`;
-        }
-
+        if (i === 0) text += `\n💡 لفك انتظار عدد:\n<code>/unlock [عدد]</code>  مثال: <code>/unlock 100</code>`;
         await adminReply(bot, msg.chat.id, text);
         if (i + CHUNK < list.length) await new Promise(r => setTimeout(r, 500));
       }
@@ -1747,28 +1734,18 @@ function startWelcomeBot() {
   });
 
   // ─── /unlock [عدد] ────────────────────────────────────
-  // يحول عدد معين من awaiting_approval → pending (الأقدم أولاً)
   bot.onText(/\/unlock(?:\s+(\d+))?/, async (msg, match) => {
     if (!isAdmin(msg)) { await unauth(msg); return; }
-
     const requestedCount = match[1] ? parseInt(match[1]) : null;
     if (!requestedCount || requestedCount < 1) {
-      await adminReply(bot, msg.chat.id,
-        `❌ يجب تحديد عدد صحيح\n\nمثال: <code>/unlock 100</code>\nأو: <code>/unlock 50</code>`
-      );
+      await adminReply(bot, msg.chat.id, `❌ يجب تحديد عدد صحيح\nمثال: <code>/unlock 100</code>`);
       return;
     }
-
     try {
       const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("awaiting_approval").once("value");
       const items = snap.val();
+      if (!items) { await adminReply(bot, msg.chat.id, "📭 لا توجد سحوبات في انتظار الحد اليومي"); return; }
 
-      if (!items) {
-        await adminReply(bot, msg.chat.id, "📭 لا توجد سحوبات في انتظار الحد اليومي");
-        return;
-      }
-
-      // رتب الأقدم أولاً وخد العدد المطلوب
       const sorted = Object.entries(items)
         .map(([id, d]) => ({ id, ...d }))
         .sort((a, b) => (a.ts || 0) - (b.ts || 0));
@@ -1776,7 +1753,6 @@ function startWelcomeBot() {
       const toUnlock = sorted.slice(0, requestedCount);
       const totalTON = toUnlock.reduce((s, w) => s + roundAmount(w.ton), 0);
 
-      // حدّث كلهم دفعة واحدة
       const updates = {};
       const now = Date.now();
       toUnlock.forEach(w => {
@@ -1789,7 +1765,6 @@ function startWelcomeBot() {
       await db.ref("withdrawQueue").update(updates);
 
       const remaining = sorted.length - toUnlock.length;
-
       await adminReply(bot, msg.chat.id,
         `✅ <b>تم فك الانتظار</b>\n` +
         `━━━━━━━━━━━━━━━━━━━━\n` +
@@ -1799,10 +1774,8 @@ function startWelcomeBot() {
         `━━━━━━━━━━━━━━━━━━━━\n\n` +
         `🚀 جاري إرسالها للمعالجة الآن...`
       );
-
       console.log(`🔓 Admin unlocked ${toUnlock.length} awaiting_approval → pending | ${totalTON.toFixed(4)} TON`);
       setTimeout(() => processPendingWithdrawals(), 1000);
-
     } catch (e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
   });
 
