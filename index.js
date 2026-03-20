@@ -1079,6 +1079,7 @@ function startWelcomeBot() {
       `/queue — قائمة الانتظار\n` +
       `/pending_reasons — تفاصيل المعلقة مع الأسباب\n` +
       `/stats — إحصائيات كاملة\n` +
+      `/lastpaid — آخر 5 معاملات مدفوعة\n` +
       `/mode — الوضع الحالي (Batch/Single)\n\n` +
       `⚙️ <b>إعدادات السحب</b>\n` +
       `/setmax [TON] — الحد الأقصى للسحب\n` +
@@ -1513,7 +1514,38 @@ function startWelcomeBot() {
     } catch(e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
   });
 
-  // ─── /pause & /resume ─────────────────────────────────
+  // ─── /lastpaid ────────────────────────────────────────
+  bot.onText(/\/lastpaid/, async (msg) => {
+    if (!isAdmin(msg)) { await unauth(msg); return; }
+    try {
+      const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("paid").once("value");
+      const items = snap.val();
+      if (!items) { await adminReply(bot, msg.chat.id, "📭 لا توجد سحوبات مدفوعة بعد"); return; }
+
+      const paid = Object.entries(items)
+        .map(([id, d]) => ({ id, ...d }))
+        .filter(d => d.completedAt || d.updatedAt)
+        .sort((a, b) => (b.completedAt || b.updatedAt || 0) - (a.completedAt || a.updatedAt || 0))
+        .slice(0, 5);
+
+      let text = `💸 <b>آخر 5 معاملات مدفوعة</b>\n${'━'.repeat(30)}\n\n`;
+      paid.forEach((w, idx) => {
+        const ton    = roundAmount(w.ton);
+        const time   = new Date(w.completedAt || w.updatedAt).toLocaleString('en-GB', { timeZone: 'UTC', hour12: false });
+        const txLink = w.txHash ? `https://tonscan.org/tx/${encodeURIComponent(w.txHash)}` : null;
+        text +=
+          `${idx + 1}. 👤 <code>${w.userId || '?'}</code>\n` +
+          `   💰 <b>${ton} TON</b>\n` +
+          `   🆔 <code>${w.id}</code>\n` +
+          `   📬 <code>${(w.address || '—').substring(0, 20)}...</code>\n` +
+          `   🕐 ${time} UTC\n` +
+          (txLink ? `   🔗 <a href="${txLink}">View TX</a>\n` : ``) +
+          `\n`;
+      });
+
+      await adminReply(bot, msg.chat.id, text, { disable_web_page_preview: true });
+    } catch(e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
+  });
   bot.onText(/\/pause/, async (msg) => {
     if (!isAdmin(msg)) { await unauth(msg); return; }
     systemPaused = true;
