@@ -522,33 +522,50 @@ async function validateWithdrawal(withdrawId, data) {
           holdReason: `إجمالي السحوبات (${projectedTotal.toFixed(3)} TON) سيتجاوز إجمالي الإيداعات (${totalDepositTon.toFixed(3)} TON)`,
         });
 
-        if (botInstance) {
-          const requestTime = new Date(data.ts || Date.now()).toLocaleString('en-GB', { timeZone: 'UTC', hour12: false });
-          const warningText =
-            `⚠️ <b>سحب يحتاج موافقة — تجاوز الإيداعات</b>\n\n` +
-            `👤 User: <code>${userId}</code>\n` +
-            `━━━━━━━━━━━━━━━━\n` +
-            `🆔 ID: <code>${withdrawId}</code>\n` +
-            `💰 المبلغ المطلوب: <b>${roundedAmount} TON</b>\n` +
-            `📥 إجمالي الإيداعات: <b>${totalDepositTon.toFixed(3)} TON</b>\n` +
-            `📤 إجمالي السحوبات المدفوعة: <b>${totalPaidTon.toFixed(3)} TON</b>\n` +
-            `📊 المتوقع بعد الدفع: <b>${projectedTotal.toFixed(3)} TON</b>\n` +
-            `📬 المحفظة:\n<code>${data.address}</code>\n` +
-            `🕐 الوقت: ${requestTime} UTC\n` +
-            `━━━━━━━━━━━━━━━━\n\n` +
-            `⚠️ إجمالي السحوبات سيتجاوز الإيداعات! هل توافق؟`;
+        const requestTime = new Date(data.ts || Date.now()).toLocaleString('en-GB', { timeZone: 'UTC', hour12: false });
+        const warningText =
+          `⚠️ <b>سحب يحتاج موافقة — تجاوز الإيداعات</b>\n\n` +
+          `👤 User: <code>${userId}</code>\n` +
+          `━━━━━━━━━━━━━━━━\n` +
+          `🆔 ID: <code>${withdrawId}</code>\n` +
+          `💰 المبلغ المطلوب: <b>${roundedAmount} TON</b>\n` +
+          `📥 إجمالي الإيداعات: <b>${totalDepositTon.toFixed(3)} TON</b>\n` +
+          `📤 إجمالي السحوبات المدفوعة: <b>${totalPaidTon.toFixed(3)} TON</b>\n` +
+          `📊 المتوقع بعد الدفع: <b>${projectedTotal.toFixed(3)} TON</b>\n` +
+          `📬 المحفظة:\n<code>${data.address}</code>\n` +
+          `🕐 الوقت: ${requestTime} UTC\n` +
+          `━━━━━━━━━━━━━━━━\n\n` +
+          `⚠️ إجمالي السحوبات سيتجاوز الإيداعات! هل توافق؟`;
 
-          await botInstance.sendMessage(ADMIN_CHAT_ID, warningText, {
-            parse_mode: 'HTML',
-            reply_markup: {
-              inline_keyboard: [[
-                { text: "✅ موافقة — ادفع الآن", callback_data: `approve_wd:${withdrawId}` },
-                { text: "❌ رفض — إلغاء",        callback_data: `reject_wd:${withdrawId}`  },
-              ]]
-            }
-          }).catch(() => {});
+        const botToken = process.env.TELEGRAM_BOT_TOKEN;
+        if (botToken) {
+          try {
+            const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: ADMIN_CHAT_ID,
+                text: warningText,
+                parse_mode: 'HTML',
+                reply_markup: {
+                  inline_keyboard: [[
+                    { text: "✅ موافقة — ادفع الآن", callback_data: `approve_wd:${withdrawId}` },
+                    { text: "❌ رفض — إلغاء",        callback_data: `reject_wd:${withdrawId}`  },
+                  ]]
+                }
+              }),
+            });
+            const resData = await res.json();
+            if (resData.ok) console.log(`📨 Deposit-exceed alert sent for ${withdrawId}`);
+            else console.log(`❌ Failed to send deposit-exceed alert: ${JSON.stringify(resData)}`);
+          } catch (e) { console.log(`❌ deposit-exceed sendMessage error: ${e.message}`); }
+        } else {
+          console.log(`❌ TELEGRAM_BOT_TOKEN missing — cannot send deposit-exceed alert`);
         }
+
         return { valid: false, skip: false };
+      } else {
+        console.log(`✅ Deposit check passed: deposited=${totalDepositTon.toFixed(3)} projected=${projectedTotal.toFixed(3)}`);
       }
     } catch (e) { console.log(`⚠️ deposit/withdraw comparison error: ${e.message}`); }
   }
