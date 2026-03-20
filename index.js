@@ -413,177 +413,78 @@ async function validateWithdrawal(withdrawId, data) {
   }
 
   // ==========================
-  // 🔹 فحص hasDeposited — رفض السحوبات بدون إيداع
+  // 🔹 فحص الإيداعات الموحد — يغطي كل الحالات
   // ==========================
   if (userId && !data.approvedByAdmin) {
-    let hasDeposited = false;
-    try {
-      // فحص مزدوج: الـ flag + الـ deposits node مباشرة
-      const [flagSnap, depositsSnap] = await Promise.all([
-        db.ref(`users/${userId}/hasDeposited`).once("value"),
-        db.ref(`users/${userId}/deposits`).once("value"),
-      ]);
-      const flagTrue = flagSnap.val() === true;
-      const depositsData = depositsSnap.val() || {};
-      const confirmedDeposits = Object.values(depositsData).filter(d => !d.status || d.status !== 'pending');
-      const hasRealDeposit = confirmedDeposits.length > 0;
-      hasDeposited = flagTrue || hasRealDeposit;
-      if (!flagTrue && hasRealDeposit) {
-        // صحح الـ flag إذا كان ناقص
-        await db.ref(`users/${userId}`).update({ hasDeposited: true }).catch(() => {});
-        console.log(`🔧 Fixed missing hasDeposited flag for user ${userId}`);
-      }
-    } catch (e) { console.log(`⚠️ hasDeposited check error: ${e.message}`); hasDeposited = true; }
-
-    if (!hasDeposited) {
-      console.log(`🚫 No-deposit rejection: user ${userId} | ${roundedAmount} TON`);
-
-      // إلغاء الطلب في قائمة الانتظار
-      await db.ref(`withdrawQueue/${withdrawId}`).update({
-        status: "cancelled",
-        error:  "No deposit on record — withdrawal rejected",
-        updatedAt: Date.now(),
-      });
-
-      // إرجاع الرصيد (الكوينز) لحساب المستخدم
-      if (wdId) {
-        try {
-          const amtCoins = data.amt || 0;
-          const userSnap = await db.ref(`users/${userId}`).once("value");
-          const userData = userSnap.val() || {};
-          const currentCoins = userData.coins || userData.bamboo || 0;
-          await db.ref(`users/${userId}`).update({
-            coins:     currentCoins + amtCoins,
-            updatedAt: Date.now(),
-          });
-          await db.ref(`users/${userId}/wdHistory/${wdId}`).update({
-            status:    "cancelled",
-            updatedAt: Date.now(),
-            reason:    "Rejected — no deposit found",
-          }).catch(() => {});
-          console.log(`↩️ Refunded ${amtCoins} coins → user ${userId}`);
-        } catch (e) { console.log(`❌ Refund error: ${e.message}`); }
-      }
-
-      // رسالة رفض للمستخدم بالإنجليزية
-      const botToken = process.env.TELEGRAM_BOT_TOKEN;
-      if (botToken && userId) {
-        await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-          method:  'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id:    userId,
-            parse_mode: 'HTML',
-            text:
-              `❌ <b>Withdrawal Rejected</b>\n\n` +
-              `━━━━━━━━━━━━━━━━\n` +
-              `💰 <b>Amount:</b> ${roundedAmount} TON\n` +
-              `━━━━━━━━━━━━━━━━\n\n` +
-              `<b>Reason:</b> Your withdrawal was rejected because no TON deposit was found on your account.\n\n` +
-              `To be eligible for withdrawals above <b>0.02 TON</b>, you must first make at least one TON deposit to the bot.\n\n` +
-              `✅ Your coins have been <b>refunded</b> back to your balance.\n\n` +
-              `🐼 Please make a deposit first, then try again.`,
-            reply_markup: { inline_keyboard: [[{ text: "🐼 Open App", url: "https://t.me/PandaBamboBot?startapp=" }]] },
-          }),
-        }).catch(() => {});
-      }
-
-      // إشعار الأدمن
-      if (botInstance) {
-        await botInstance.sendMessage(ADMIN_CHAT_ID,
-          `🚫 <b>سحب مرفوض — لا يوجد إيداع</b>\n\n` +
-          `👤 User: <code>${userId}</code>\n` +
-          `🆔 Withdraw ID: <code>${withdrawId}</code>\n` +
-          `💰 المبلغ: <b>${roundedAmount} TON</b>\n` +
-          `🪙 Coins: <b>${(data.amt || 0).toLocaleString()}</b>\n` +
-          `📬 المحفظة: <code>${addr.substring(0, 40)}</code>\n\n` +
-          `✅ تم إرجاع الرصيد للمستخدم تلقائياً`,
-          { parse_mode: 'HTML' }
-        ).catch(() => {});
-      }
-
-      return { valid: false, skip: true };
-    }
-  }
-
-  // ==========================
-  // 🔹 فحص: إجمالي السحوبات > إجمالي الإيداعات → موافقة أدمن
-  // ==========================
-  if (userId && data.status !== 'awaiting_approval' && !data.approvedByAdmin) {
     try {
       const [depositsSnap, paidWdSnap] = await Promise.all([
         db.ref(`users/${userId}/deposits`).once("value"),
         db.ref("withdrawQueue").orderByChild("userId").equalTo(userId).once("value"),
       ]);
-      const depositsData    = depositsSnap.val() || {};
-      const totalDepositTon = Object.values(depositsData)
-        .filter(d => !d.status || d.status !== 'pending')
-        .reduce((s, d) => s + (Number(d.amount) || 0), 0);
 
-      const paidWdData = paidWdSnap.val() || {};
+      // إجمالي الإيداعات الحقيقية (تجاهل pending)
+      const depositsData    = depositsSnap.val() || {};
+      const confirmedDeps   = Object.values(depositsData).filter(d => !d.status || d.status !== 'pending');
+      const totalDepositTon = confirmedDeps.reduce((s, d) => s + (Number(d.amount) || 0), 0);
+
+      // إجمالي السحوبات المدفوعة سابقاً
+      const paidWdData   = paidWdSnap.val() || {};
       const totalPaidTon = Object.values(paidWdData)
         .filter(d => d.status === 'paid')
         .reduce((s, d) => s + roundAmount(d.ton), 0);
 
       const projectedTotal = totalPaidTon + roundedAmount;
 
+      console.log(`🔍 Deposit check [${userId}]: deposited=${totalDepositTon.toFixed(3)} paidSoFar=${totalPaidTon.toFixed(3)} thisWd=${roundedAmount} projected=${projectedTotal.toFixed(3)}`);
+
       if (projectedTotal > totalDepositTon) {
-        console.log(`⚠️ Withdrawals exceed deposits: user ${userId} | deposited=${totalDepositTon.toFixed(3)} | paid+this=${projectedTotal.toFixed(3)}`);
         await db.ref(`withdrawQueue/${withdrawId}`).update({
-          status: "awaiting_approval",
+          status:    "awaiting_approval",
           updatedAt: Date.now(),
-          holdReason: `إجمالي السحوبات (${projectedTotal.toFixed(3)} TON) سيتجاوز إجمالي الإيداعات (${totalDepositTon.toFixed(3)} TON)`,
+          holdReason: `السحوبات (${projectedTotal.toFixed(3)} TON) تتجاوز الإيداعات (${totalDepositTon.toFixed(3)} TON)`,
         });
 
-        const requestTime = new Date(data.ts || Date.now()).toLocaleString('en-GB', { timeZone: 'UTC', hour12: false });
         const zeroDeposit = totalDepositTon === 0;
+        const requestTime = new Date(data.ts || Date.now()).toLocaleString('en-GB', { timeZone: 'UTC', hour12: false });
         const warningText =
-          `⚠️ <b>سحب يحتاج موافقة — ${zeroDeposit ? 'لا يوجد إيداع' : 'تجاوز الإيداعات'}</b>\n\n` +
+          `⚠️ <b>سحب يحتاج موافقة — ${zeroDeposit ? '🚨 لا يوجد إيداع' : 'تجاوز الإيداعات'}</b>\n\n` +
           `👤 User: <code>${userId}</code>\n` +
           `━━━━━━━━━━━━━━━━\n` +
           `🆔 ID: <code>${withdrawId}</code>\n` +
-          `💰 المبلغ المطلوب: <b>${roundedAmount} TON</b>\n` +
-          `📥 إجمالي الإيداعات: <b>${zeroDeposit ? '❌ لا يوجد إيداع' : totalDepositTon.toFixed(3) + ' TON'}</b>\n` +
-          `📤 إجمالي السحوبات المدفوعة: <b>${totalPaidTon.toFixed(3)} TON</b>\n` +
-          `📊 المتوقع بعد الدفع: <b>${projectedTotal.toFixed(3)} TON</b>\n` +
+          `💰 المبلغ: <b>${roundedAmount} TON</b>\n` +
+          `📥 إجمالي الإيداعات: <b>${zeroDeposit ? '❌ لا يوجد' : totalDepositTon.toFixed(3) + ' TON'}</b>\n` +
+          `📤 سحوبات مدفوعة سابقاً: <b>${totalPaidTon.toFixed(3)} TON</b>\n` +
+          `📊 الإجمالي بعد الدفع: <b>${projectedTotal.toFixed(3)} TON</b>\n` +
           `📬 المحفظة:\n<code>${data.address}</code>\n` +
           `🕐 الوقت: ${requestTime} UTC\n` +
           `━━━━━━━━━━━━━━━━\n\n` +
-          (zeroDeposit
-            ? `🚨 هذا المستخدم لم يودع أي مبلغ! هل توافق على السحب؟`
-            : `⚠️ إجمالي السحوبات سيتجاوز الإيداعات! هل توافق؟`);
+          (zeroDeposit ? `🚨 المستخدم لم يودع أي مبلغ! هل توافق؟` : `⚠️ السحوبات ستتجاوز الإيداعات! هل توافق؟`);
 
         const botToken = process.env.TELEGRAM_BOT_TOKEN;
         if (botToken) {
-          try {
-            const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                chat_id: ADMIN_CHAT_ID,
-                text: warningText,
-                parse_mode: 'HTML',
-                reply_markup: {
-                  inline_keyboard: [[
-                    { text: "✅ موافقة — ادفع الآن", callback_data: `approve_wd:${withdrawId}` },
-                    { text: "❌ رفض — إلغاء",        callback_data: `reject_wd:${withdrawId}`  },
-                  ]]
-                }
-              }),
-            });
-            const resData = await res.json();
-            if (resData.ok) console.log(`📨 Deposit-exceed alert sent for ${withdrawId}`);
-            else console.log(`❌ Failed to send deposit-exceed alert: ${JSON.stringify(resData)}`);
-          } catch (e) { console.log(`❌ deposit-exceed sendMessage error: ${e.message}`); }
-        } else {
-          console.log(`❌ TELEGRAM_BOT_TOKEN missing — cannot send deposit-exceed alert`);
+          const res = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id:      ADMIN_CHAT_ID,
+              text:         warningText,
+              parse_mode:   'HTML',
+              reply_markup: {
+                inline_keyboard: [[
+                  { text: "✅ موافقة — ادفع الآن", callback_data: `approve_wd:${withdrawId}` },
+                  { text: "❌ رفض — إلغاء",        callback_data: `reject_wd:${withdrawId}`  },
+                ]]
+              }
+            }),
+          });
+          const resData = await res.json();
+          if (resData.ok) console.log(`📨 Deposit alert sent for ${withdrawId}`);
+          else console.log(`❌ Deposit alert failed: ${JSON.stringify(resData)}`);
         }
-
         return { valid: false, skip: false };
-      } else {
-        console.log(`✅ Deposit check passed: deposited=${totalDepositTon.toFixed(3)} projected=${projectedTotal.toFixed(3)}`);
       }
-    } catch (e) { console.log(`⚠️ deposit/withdraw comparison error: ${e.message}`); }
+      console.log(`✅ Deposit check passed for ${userId}`);
+    } catch (e) { console.log(`⚠️ Deposit check error: ${e.message}`); }
   }
 
   if (userId) {
