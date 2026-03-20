@@ -408,75 +408,76 @@ async function validateWithdrawal(withdrawId, data) {
     return { valid: false, skip: true };
   }
 
+  // ─── فحص hasDeposited: سحب > 0.02 TON بدون إيداع = رفض فوري ────────────
+  if (userId && roundedAmount > 0.02) {
+    try {
+      const depositSnap = await db.ref(`users/${userId}/hasDeposited`).once("value");
+      const hasDeposited = depositSnap.val();
+      if (!hasDeposited) {
+        // أعِد الرصيد للمستخدم
+        const amtCoins = data.amt || 0;
+        await db.ref(`users/${userId}/coins`).transaction(current => (current || 0) + Number(amtCoins));
+
+        // ألغِ الطلب
+        await db.ref(`withdrawQueue/${withdrawId}`).update({
+          status: "cancelled",
+          error: "No deposit found — withdrawal above 0.02 TON rejected",
+          updatedAt: Date.now(),
+        });
+        if (wdId) {
+          await db.ref(`users/${userId}/wdHistory/${wdId}`)
+            .update({ status: "cancelled", updatedAt: Date.now() }).catch(() => {});
+        }
+
+        // أبلغ المستخدم
+        if (botInstance) {
+          const botToken = process.env.TELEGRAM_BOT_TOKEN;
+          if (botToken) {
+            await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                chat_id: userId,
+                text:
+                  `🐼 <b>Withdrawal Rejected</b>\n\n` +
+                  `❌ Your withdrawal request of <b>${roundedAmount} TON</b> has been rejected.\n\n` +
+                  `<b>Reason:</b> No deposit was found on your account. Withdrawals above <b>0.02 TON</b> require at least one prior deposit through the bot.\n\n` +
+                  `💰 Your balance has been refunded.\n\n` +
+                  `If you believe this is a mistake, please contact support.`,
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: [[{ text: "🐼 Open App", url: "https://t.me/PandaBamboBot?startapp=" }]] }
+              }),
+            }).catch(() => {});
+          }
+
+          // أبلغ الأدمن
+          await botInstance.sendMessage(ADMIN_CHAT_ID,
+            `🚫 <b>سحب مرفوض — لا إيداع</b>\n\n` +
+            `👤 User: <code>${userId}</code>\n` +
+            `🆔 ID: <code>${withdrawId}</code>\n` +
+            `💰 المبلغ: <b>${roundedAmount} TON</b>\n` +
+            `🪙 Bamboo: <b>${Number(amtCoins).toLocaleString()}</b>\n` +
+            `📬 المحفظة: <code>${addr.substring(0, 48)}</code>\n\n` +
+            `⚠️ <b>السبب:</b> hasDeposited = false (سحب > 0.02 TON)\n` +
+            `🔄 تم إعادة الرصيد للمستخدم تلقائياً`,
+            { parse_mode: 'HTML' }
+          ).catch(() => {});
+        }
+
+        console.log(`🚫 [${withdrawId}] Rejected — no deposit | user: ${userId} | ${roundedAmount} TON refunded`);
+        return { valid: false, skip: true };
+      }
+    } catch (e) {
+      console.log(`❌ hasDeposited check error [${withdrawId}]: ${e.message}`);
+    }
+  }
+  // ─────────────────────────────────────────────────────────────────────────
+
   // فحص حظر المحفظة
   if (await isWalletBanned(data.address)) {
     await db.ref(`withdrawQueue/${withdrawId}`).update({ status: "cancelled", error: "Wallet is banned", updatedAt: Date.now() });
     if (userId && wdId) await db.ref(`users/${userId}/wdHistory/${wdId}`).update({ status: "cancelled", updatedAt: Date.now() });
     return { valid: false, skip: true };
-  }
-
-  // ── فحص الإيداع: لو المبلغ > 0.02 TON والمستخدم لم يودع → رفض فوري ──
-  if (userId && roundedAmount > 0.02) {
-    try {
-      const depositSnap = await db.ref(`users/${userId}/hasDeposited`).once('value');
-      const hasDeposited = depositSnap.val() === true;
-
-      if (!hasDeposited) {
-        console.log(`🚫 No-deposit rejection [${withdrawId}] user=${userId} amount=${roundedAmount} TON`);
-
-        const coinsToRefund = Number(data.amt || 0);
-        if (coinsToRefund > 0) {
-          await db.ref(`users/${userId}/coins`).transaction(cur => (cur || 0) + coinsToRefund);
-          console.log(`↩️ Refunded ${coinsToRefund} coins to user ${userId}`);
-        }
-
-        await db.ref(`withdrawQueue/${withdrawId}`).update({
-          status:    'cancelled',
-          error:     'Rejected: no deposit on record — withdrawal above 0.02 TON requires at least one prior deposit.',
-          updatedAt: Date.now(),
-        });
-
-        if (wdId) {
-          await db.ref(`users/${userId}/wdHistory/${wdId}`).update({
-            status: 'cancelled', updatedAt: Date.now(),
-          }).catch(() => {});
-        }
-
-        const botToken = process.env.TELEGRAM_BOT_TOKEN;
-        if (botToken && data.chatId) {
-          await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              chat_id:    data.chatId,
-              parse_mode: 'HTML',
-              text:
-                `❌ <b>Withdrawal Rejected</b>\n\n` +
-                `Your withdrawal of <b>${roundedAmount} TON</b> has been rejected.\n\n` +
-                `<b>Reason:</b> No deposit found on your account.\n` +
-                `Withdrawals above <b>0.02 TON</b> require at least one prior deposit.\n\n` +
-                `✅ Your coins (<b>${coinsToRefund.toLocaleString()}</b>) have been returned to your balance.\n\n` +
-                `Please make a deposit first, then try again. 🐼`,
-            }),
-          }).catch(() => {});
-        }
-
-        if (botInstance) {
-          await botInstance.sendMessage(ADMIN_CHAT_ID,
-            `🚫 <b>سحب مرفوض — لا يوجد إيداع</b>\n\n` +
-            `👤 User: <code>${userId}</code>\n` +
-            `🆔 ID: <code>${withdrawId}</code>\n` +
-            `💰 المبلغ: <b>${roundedAmount} TON</b>\n` +
-            `↩️ تم إعادة: <b>${coinsToRefund.toLocaleString()} coins</b>`,
-            { parse_mode: 'HTML' }
-          ).catch(() => {});
-        }
-
-        return { valid: false, skip: true };
-      }
-    } catch (e) {
-      console.log(`⚠️ hasDeposited check error [${withdrawId}]: ${e.message}`);
-    }
   }
 
   // انتظار موافقة الأدمن
@@ -1005,6 +1006,7 @@ function startWelcomeBot() {
       `📊 <b>المعلومات والمراقبة</b>\n` +
       `/balance — رصيد محفظة TON\n` +
       `/queue — قائمة الانتظار\n` +
+      `/awaiting_queue — السحوبات المعلقة بالحد اليومي + إجمالي TON\n` +
       `/pending_reasons — تفاصيل المعلقة مع الأسباب\n` +
       `/stats — إحصائيات كاملة\n` +
       `/mode — الوضع الحالي (Batch/Single)\n\n` +
@@ -1025,6 +1027,7 @@ function startWelcomeBot() {
 
       `🔧 <b>التحكم</b>\n` +
       `/process — تشغيل المعالجة يدوياً\n` +
+      `/unlock [عدد] — تحرير عدد محدد من طلبات الحد اليومي (بدون عدد = الكل)\n` +
       `/pause — إيقاف المعالجة\n` +
       `/resume — استئناف المعالجة\n` +
       `/clearqueue — إلغاء جميع السحوبات المعلقة\n` +
@@ -1039,11 +1042,7 @@ function startWelcomeBot() {
 
       `🕵️ <b>كشف التلاعب</b>\n` +
       `/check_suspicious — كشف محافظ مشتركة (+3 مستخدمين)\n` +
-      `/reject_suspicious — رفض وحظر جميع المشبوهين\n` +
-
-      `⏳ <b>إدارة الحد اليومي</b>\n` +
-      `/awaiting_queue — عرض السحوبات المعلقة بسبب الحد اليومي + إجمالي التون\n` +
-      `/unlock [عدد] — تحرير عدد محدد من الطلبات للدفع (مثال: /unlock 100)\n`
+      `/reject_suspicious — رفض وحظر جميع المشبوهين\n`
     );
   });
 
@@ -1634,6 +1633,93 @@ function startWelcomeBot() {
     }
   });
 
+  // ─── /awaiting_queue ──────────────────────────────────
+  bot.onText(/\/awaiting_queue/, async (msg) => {
+    if (!isAdmin(msg)) { await unauth(msg); return; }
+    try {
+      const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("awaiting_approval").once("value");
+      const items = snap.val();
+      if (!items) { await adminReply(bot, msg.chat.id, "📭 لا توجد سحوبات معلقة بسبب الحد اليومي"); return; }
+
+      const list = Object.entries(items)
+        .map(([id, d]) => ({ id, ...d }))
+        .sort((a, b) => (a.ts || 0) - (b.ts || 0));
+
+      const totalTON = list.reduce((s, d) => s + roundAmount(d.ton), 0);
+
+      const CHUNK = 15;
+      for (let i = 0; i < list.length; i += CHUNK) {
+        const chunk = list.slice(i, i + CHUNK);
+        let text = i === 0
+          ? `⏳ <b>قائمة السحوبات المعلقة — الحد اليومي</b>\n` +
+            `📊 الإجمالي: <b>${list.length}</b> طلب | <b>${totalTON.toFixed(4)} TON</b>\n` +
+            `${'━'.repeat(32)}\n\n`
+          : `⏳ <b>تابع... (${i + 1}–${Math.min(i + CHUNK, list.length)})</b>\n\n`;
+
+        chunk.forEach((w, idx) => {
+          const ton      = roundAmount(w.ton);
+          const time     = w.ts     ? new Date(w.ts).toLocaleString('en-GB', { timeZone: 'UTC', hour12: false }) : '—';
+          const unlock   = w.unlockAt ? new Date(w.unlockAt).toLocaleString('en-GB', { timeZone: 'UTC', hour12: false }) : '—';
+          text +=
+            `${i + idx + 1}. 👤 <code>${w.userId || '?'}</code>\n` +
+            `   🆔 <code>${w.id}</code>\n` +
+            `   💰 ${ton} TON | 🪙 ${Number(w.amt || 0).toLocaleString()}\n` +
+            `   🕐 طلب: ${time} UTC\n` +
+            `   🔓 يُفتح: ${unlock} UTC\n\n`;
+        });
+
+        await adminReply(bot, msg.chat.id, text);
+        if (i + CHUNK < list.length) await new Promise(r => setTimeout(r, 500));
+      }
+    } catch (e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
+  });
+
+  // ─── /unlock [عدد] ────────────────────────────────────
+  bot.onText(/\/unlock(?:\s+(\d+))?/, async (msg, match) => {
+    if (!isAdmin(msg)) { await unauth(msg); return; }
+    try {
+      const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("awaiting_approval").once("value");
+      const items = snap.val();
+      if (!items) { await adminReply(bot, msg.chat.id, "📭 لا توجد سحوبات معلقة بالحد اليومي"); return; }
+
+      const list = Object.entries(items)
+        .map(([id, d]) => ({ id, ...d }))
+        .sort((a, b) => (a.ts || 0) - (b.ts || 0));
+
+      const countArg = match[1] ? parseInt(match[1]) : list.length;
+      if (isNaN(countArg) || countArg < 1) {
+        await adminReply(bot, msg.chat.id, "❌ عدد غير صحيح. الاستخدام: /unlock [عدد]");
+        return;
+      }
+
+      const toUnlock = list.slice(0, countArg);
+      const now = Date.now();
+      let released = 0;
+
+      for (const w of toUnlock) {
+        await db.ref(`withdrawQueue/${w.id}`).update({
+          status:          "pending",
+          updatedAt:       now,
+          holdReason:      null,
+          unlockAt:        null,
+          lastError:       null,
+          approvedByAdmin: true,
+        }).catch(() => {});
+        released++;
+      }
+
+      await adminReply(bot, msg.chat.id,
+        `🔓 <b>تم تحرير ${released} سحب</b> من قائمة الانتظار\n` +
+        (list.length - released > 0
+          ? `⏳ لا يزال في الانتظار: <b>${list.length - released}</b>\n`
+          : `✅ القائمة فارغة الآن\n`) +
+        `\n🔄 جاري معالجة الطلبات المحررة...`
+      );
+
+      setTimeout(() => processPendingWithdrawals(), 1000);
+    } catch (e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
+  });
+
   // ─── /pending_reasons ─────────────────────────────────
   bot.onText(/\/pending_reasons/, async (msg) => {
     if (!isAdmin(msg)) { await unauth(msg); return; }
@@ -1680,95 +1766,6 @@ function startWelcomeBot() {
         await adminReply(bot, msg.chat.id, text);
         if (i + CHUNK < held.length) await new Promise(r => setTimeout(r, 500));
       }
-    } catch (e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
-  });
-
-  // ─── /awaiting_queue ──────────────────────────────────
-  bot.onText(/\/awaiting_queue/, async (msg) => {
-    if (!isAdmin(msg)) { await unauth(msg); return; }
-    try {
-      const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("awaiting_approval").once("value");
-      const items = snap.val();
-      if (!items) { await adminReply(bot, msg.chat.id, "📭 لا توجد سحوبات في انتظار الحد اليومي"); return; }
-
-      const list = Object.entries(items)
-        .map(([id, d]) => ({ id, ...d }))
-        .sort((a, b) => (a.ts || 0) - (b.ts || 0));
-
-      const totalTON = list.reduce((s, w) => s + roundAmount(w.ton), 0);
-
-      const CHUNK = 15;
-      for (let i = 0; i < list.length; i += CHUNK) {
-        const chunk = list.slice(i, i + CHUNK);
-        let text = i === 0
-          ? `⏳ <b>سحوبات انتظار الحد اليومي</b>\n` +
-            `━━━━━━━━━━━━━━━━━━━━\n` +
-            `📦 الإجمالي: <b>${list.length}</b> طلب\n` +
-            `💰 إجمالي التون: <b>${totalTON.toFixed(4)} TON</b>\n` +
-            `━━━━━━━━━━━━━━━━━━━━\n\n`
-          : `⏳ <b>تابع... (${i + 1}–${Math.min(i + CHUNK, list.length)})</b>\n\n`;
-
-        chunk.forEach((w, idx) => {
-          const ton  = roundAmount(w.ton);
-          const time = w.ts ? new Date(w.ts).toLocaleString('en-GB', { timeZone: 'UTC', hour12: false }) : '—';
-          text +=
-            `${i + idx + 1}. 👤 <code>${w.userId || '?'}</code>\n` +
-            `   🆔 <code>${w.id}</code>\n` +
-            `   💰 <b>${ton} TON</b> | 🪙 ${Number(w.amt || 0).toLocaleString()}\n` +
-            `   📬 <code>${String(w.address || '').substring(0, 20)}...</code>\n` +
-            `   🕐 ${time} UTC\n\n`;
-        });
-
-        if (i === 0) text += `\n💡 لفك انتظار عدد:\n<code>/unlock [عدد]</code>  مثال: <code>/unlock 100</code>`;
-        await adminReply(bot, msg.chat.id, text);
-        if (i + CHUNK < list.length) await new Promise(r => setTimeout(r, 500));
-      }
-    } catch (e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
-  });
-
-  // ─── /unlock [عدد] ────────────────────────────────────
-  bot.onText(/\/unlock(?:\s+(\d+))?/, async (msg, match) => {
-    if (!isAdmin(msg)) { await unauth(msg); return; }
-    const requestedCount = match[1] ? parseInt(match[1]) : null;
-    if (!requestedCount || requestedCount < 1) {
-      await adminReply(bot, msg.chat.id, `❌ يجب تحديد عدد صحيح\nمثال: <code>/unlock 100</code>`);
-      return;
-    }
-    try {
-      const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("awaiting_approval").once("value");
-      const items = snap.val();
-      if (!items) { await adminReply(bot, msg.chat.id, "📭 لا توجد سحوبات في انتظار الحد اليومي"); return; }
-
-      const sorted = Object.entries(items)
-        .map(([id, d]) => ({ id, ...d }))
-        .sort((a, b) => (a.ts || 0) - (b.ts || 0));
-
-      const toUnlock = sorted.slice(0, requestedCount);
-      const totalTON = toUnlock.reduce((s, w) => s + roundAmount(w.ton), 0);
-
-      const updates = {};
-      const now = Date.now();
-      toUnlock.forEach(w => {
-        updates[`${w.id}/status`]          = "pending";
-        updates[`${w.id}/approvedByAdmin`] = true;
-        updates[`${w.id}/updatedAt`]       = now;
-        updates[`${w.id}/holdReason`]      = null;
-        updates[`${w.id}/unlockedAt`]      = now;
-      });
-      await db.ref("withdrawQueue").update(updates);
-
-      const remaining = sorted.length - toUnlock.length;
-      await adminReply(bot, msg.chat.id,
-        `✅ <b>تم فك الانتظار</b>\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n` +
-        `🔓 تم تحرير: <b>${toUnlock.length}</b> طلب\n` +
-        `💰 إجمالي التون: <b>${totalTON.toFixed(4)} TON</b>\n` +
-        `⏳ متبقي في الانتظار: <b>${remaining}</b> طلب\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n\n` +
-        `🚀 جاري إرسالها للمعالجة الآن...`
-      );
-      console.log(`🔓 Admin unlocked ${toUnlock.length} awaiting_approval → pending | ${totalTON.toFixed(4)} TON`);
-      setTimeout(() => processPendingWithdrawals(), 1000);
     } catch (e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
   });
 
