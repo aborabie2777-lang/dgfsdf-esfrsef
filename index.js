@@ -386,6 +386,32 @@ async function validateWithdrawal(withdrawId, data) {
     return { valid: false, skip: false };
   }
 
+  if (roundedAmount < 0.1) {
+    console.log(`🚫 Min 0.1 TON rejection: user ${userId} | ${roundedAmount} TON`);
+    await db.ref(`withdrawQueue/${withdrawId}`).update({
+      status: "cancelled",
+      error:  "Below minimum 0.1 TON — withdrawal rejected",
+      updatedAt: Date.now(),
+    });
+    if (userId && wdId) {
+      try {
+        const amtCoins = data.amt || 0;
+        const userSnap = await db.ref(`users/${userId}`).once("value");
+        const userData = userSnap.val() || {};
+        const currentCoins = userData.coins || userData.bamboo || 0;
+        await db.ref(`users/${userId}`).update({ coins: currentCoins + amtCoins, updatedAt: Date.now() });
+        await db.ref(`users/${userId}/wdHistory/${wdId}`).update({ status: "cancelled", updatedAt: Date.now(), reason: "Below min 0.1 TON" }).catch(() => {});
+      } catch (e) { console.log(`❌ Refund error (min check): ${e.message}`); }
+    }
+    if (botInstance) {
+      await botInstance.sendMessage(ADMIN_CHAT_ID,
+        `🚫 <b>سحب مرفوض — أقل من 0.1 TON</b>\n\n👤 User: <code>${userId}</code>\n💰 المبلغ: <b>${roundedAmount} TON</b>`,
+        { parse_mode: 'HTML' }
+      ).catch(() => {});
+    }
+    return { valid: false, skip: true };
+  }
+
   // ==========================
   // 🔹 فحص hasDeposited — رفض السحوبات > 0.02 TON بدون إيداع
   // ==========================
@@ -465,6 +491,66 @@ async function validateWithdrawal(withdrawId, data) {
 
       return { valid: false, skip: true };
     }
+  }
+
+  // ==========================
+  // 🔹 فحص: إجمالي السحوبات > إجمالي الإيداعات → موافقة أدمن
+  // ==========================
+  if (userId && data.status !== 'awaiting_approval') {
+    try {
+      const [depositsSnap, paidWdSnap] = await Promise.all([
+        db.ref(`users/${userId}/deposits`).once("value"),
+        db.ref("withdrawQueue").orderByChild("userId").equalTo(userId).once("value"),
+      ]);
+      const depositsData    = depositsSnap.val() || {};
+      const totalDepositTon = Object.values(depositsData)
+        .filter(d => !d.status || d.status !== 'pending')
+        .reduce((s, d) => s + (Number(d.amount) || 0), 0);
+
+      const paidWdData = paidWdSnap.val() || {};
+      const totalPaidTon = Object.values(paidWdData)
+        .filter(d => d.status === 'paid')
+        .reduce((s, d) => s + roundAmount(d.ton), 0);
+
+      const projectedTotal = totalPaidTon + roundedAmount;
+
+      if (totalDepositTon > 0 && projectedTotal > totalDepositTon) {
+        console.log(`⚠️ Withdrawals exceed deposits: user ${userId} | deposited=${totalDepositTon.toFixed(3)} | paid+this=${projectedTotal.toFixed(3)}`);
+        await db.ref(`withdrawQueue/${withdrawId}`).update({
+          status: "awaiting_approval",
+          updatedAt: Date.now(),
+          holdReason: `إجمالي السحوبات (${projectedTotal.toFixed(3)} TON) سيتجاوز إجمالي الإيداعات (${totalDepositTon.toFixed(3)} TON)`,
+        });
+
+        if (botInstance) {
+          const requestTime = new Date(data.ts || Date.now()).toLocaleString('en-GB', { timeZone: 'UTC', hour12: false });
+          const warningText =
+            `⚠️ <b>سحب يحتاج موافقة — تجاوز الإيداعات</b>\n\n` +
+            `👤 User: <code>${userId}</code>\n` +
+            `━━━━━━━━━━━━━━━━\n` +
+            `🆔 ID: <code>${withdrawId}</code>\n` +
+            `💰 المبلغ المطلوب: <b>${roundedAmount} TON</b>\n` +
+            `📥 إجمالي الإيداعات: <b>${totalDepositTon.toFixed(3)} TON</b>\n` +
+            `📤 إجمالي السحوبات المدفوعة: <b>${totalPaidTon.toFixed(3)} TON</b>\n` +
+            `📊 المتوقع بعد الدفع: <b>${projectedTotal.toFixed(3)} TON</b>\n` +
+            `📬 المحفظة:\n<code>${data.address}</code>\n` +
+            `🕐 الوقت: ${requestTime} UTC\n` +
+            `━━━━━━━━━━━━━━━━\n\n` +
+            `⚠️ إجمالي السحوبات سيتجاوز الإيداعات! هل توافق؟`;
+
+          await botInstance.sendMessage(ADMIN_CHAT_ID, warningText, {
+            parse_mode: 'HTML',
+            reply_markup: {
+              inline_keyboard: [[
+                { text: "✅ موافقة — ادفع الآن", callback_data: `approve_wd:${withdrawId}` },
+                { text: "❌ رفض — إلغاء",        callback_data: `reject_wd:${withdrawId}`  },
+              ]]
+            }
+          }).catch(() => {});
+        }
+        return { valid: false, skip: false };
+      }
+    } catch (e) { console.log(`⚠️ deposit/withdraw comparison error: ${e.message}`); }
   }
 
   if (userId) {
@@ -1000,7 +1086,9 @@ function startWelcomeBot() {
       `/unbanuser [userId] — رفع حظر مستخدم\n` +
       `/banwallet [address] — حظر محفظة\n` +
       `/unwallet [address] — رفع حظر محفظة\n` +
-      `/userinfo [userId] — معلومات مستخدم\n\n` +
+      `/userinfo [userId] — معلومات مستخدم كاملة\n` +
+      `/addcoins [userId] [كمية] — إضافة Coins لمستخدم\n` +
+      `/addbamboo [userId] [كمية] — إضافة Bamboo لمستخدم\n\n` +
       `🕵️ <b>كشف التلاعب</b>\n` +
       `/check_suspicious — كشف محافظ مشتركة (+3 مستخدمين)\n` +
       `/reject_suspicious — رفض وحظر جميع المشبوهين\n\n` +
@@ -1240,10 +1328,15 @@ function startWelcomeBot() {
     if (!isAdmin(msg)) { await unauth(msg); return; }
     const userId = match[1].trim();
     try {
-      const [bannedSnap, wdSnap] = await Promise.all([
+      const [bannedSnap, wdSnap, depositsSnap, referralsSnap, referralEarningsSnap, userSnap] = await Promise.all([
         db.ref(`bannedUsers/${userId}`).once("value"),
         db.ref("withdrawQueue").orderByChild("userId").equalTo(userId).once("value"),
+        db.ref(`users/${userId}/deposits`).once("value"),
+        db.ref(`users/${userId}/referrals`).once("value"),
+        db.ref(`users/${userId}/referralEarnings`).once("value"),
+        db.ref(`users/${userId}`).once("value"),
       ]);
+
       const isBanned  = bannedSnap.exists();
       const wdItems   = wdSnap.val() || {};
       const allWds    = Object.values(wdItems);
@@ -1252,16 +1345,154 @@ function startWelcomeBot() {
       const cancelled = allWds.filter(d => d.status === 'cancelled');
       const totalPaid = paid.reduce((s, d) => s + roundAmount(d.ton), 0);
       const wallets   = [...new Set(allWds.map(d => d.address).filter(Boolean))];
+
+      // ── إحصائيات الإيداعات ──
+      const depositsData = depositsSnap.val() || {};
+      const depositsList = Object.entries(depositsData);
+      // فقط الإيداعات المؤكدة (تجاهل pending)
+      const confirmedDeposits = depositsList.filter(([, d]) => !d.status || d.status !== 'pending');
+      const totalDepositTon   = confirmedDeposits.reduce((s, [, d]) => s + (Number(d.amount) || 0), 0);
+      const totalDepositCount = confirmedDeposits.length;
+
+      // ── إحصائيات الإحالات ──
+      const referralsData    = referralsSnap.val() || {};
+      const totalReferrals   = Object.keys(referralsData).length;
+
+      // عدد الإحالات النشطة (unique users من referralEarnings)
+      const earningsData     = referralEarningsSnap.val() || {};
+      const activeReferrers  = new Set(Object.values(earningsData).map(e => e.fromUserId).filter(Boolean));
+      const activeReferrals  = activeReferrers.size;
+
+      // ── رصيد الكوينز والبامبو ──
+      const userData   = userSnap.val() || {};
+      const bambooBalance = userData.bamboo || 0;
+      const coinsBalance  = userData.coins  || 0;
+
+      // ── إجمالي السحوبات لمقارنة مع الإيداعات ──
+      const totalWithdrawTon = paid.reduce((s, d) => s + roundAmount(d.ton), 0);
+
+      // ── روابط الإيداعات ──
+      let depositsText = '';
+      if (confirmedDeposits.length > 0) {
+        const lastDeposits = confirmedDeposits.slice(-5); // آخر 5 إيداعات
+        depositsText = `\n🔗 <b>آخر الإيداعات (روابط المعاملات):</b>\n`;
+        lastDeposits.forEach(([, d], idx) => {
+          const amt  = Number(d.amount || 0).toFixed(3);
+          const date = d.date ? new Date(d.date).toLocaleDateString('en-GB') : (d.timestamp ? new Date(d.timestamp).toLocaleDateString('en-GB') : '—');
+          if (d.txLink) {
+            depositsText += `${idx + 1}. 💎 ${amt} TON — ${date} — <a href="${d.txLink}">🔍 عرض</a>\n`;
+          } else if (d.txHash) {
+            const cleanHash = encodeURIComponent(d.txHash);
+            depositsText += `${idx + 1}. 💎 ${amt} TON — ${date} — <a href="https://tonscan.org/tx/${cleanHash}">🔍 عرض</a>\n`;
+          } else {
+            depositsText += `${idx + 1}. 💎 ${amt} TON — ${date}\n`;
+          }
+        });
+        if (confirmedDeposits.length > 5) depositsText += `... و${confirmedDeposits.length - 5} إيداع أقدم\n`;
+      } else {
+        depositsText = `\n⚠️ لا توجد إيداعات مؤكدة\n`;
+      }
+
+      // ── تحذير إذا السحوبات > الإيداعات ──
+      const suspiciousWithdraw = totalDepositTon > 0 && totalWithdrawTon > totalDepositTon;
+      const noDepositWarning   = totalDepositTon === 0 && totalPaid > 0;
+
       let text =
-        `👤 <b>معلومات المستخدم</b>\n🆔 ID: <code>${userId}</code>\n🚫 محظور: <b>${isBanned ? 'نعم ❌' : 'لا ✅'}</b>\n\n` +
-        `📊 <b>السحوبات</b>\n✅ مدفوعة: <b>${paid.length}</b> (${totalPaid.toFixed(3)} TON)\n⏳ معلقة: <b>${pending.length}</b>\n🚫 ملغاة: <b>${cancelled.length}</b>\n\n` +
+        `👤 <b>معلومات المستخدم</b>\n` +
+        `🆔 ID: <code>${userId}</code>\n` +
+        `🚫 محظور: <b>${isBanned ? 'نعم ❌' : 'لا ✅'}</b>\n` +
+        `${'━'.repeat(30)}\n\n` +
+
+        `💰 <b>الرصيد الحالي</b>\n` +
+        `🎍 Bamboo: <b>${Number(bambooBalance).toLocaleString()}</b>\n` +
+        `🪙 Coins: <b>${Number(coinsBalance).toLocaleString()}</b>\n` +
+        `${'━'.repeat(30)}\n\n` +
+
+        `📥 <b>الإيداعات</b>\n` +
+        `💎 إجمالي الإيداعات: <b>${totalDepositTon.toFixed(3)} TON</b>\n` +
+        `🔢 عدد المعاملات: <b>${totalDepositCount}</b>\n` +
+        depositsText +
+        `${'━'.repeat(30)}\n\n` +
+
+        `📤 <b>السحوبات</b>\n` +
+        `✅ مدفوعة: <b>${paid.length}</b> (<b>${totalPaid.toFixed(3)} TON</b>)\n` +
+        `⏳ معلقة: <b>${pending.length}</b>\n` +
+        `🚫 ملغاة: <b>${cancelled.length}</b>\n` +
+        (suspiciousWithdraw ? `\n⚠️ <b>تحذير: إجمالي السحوبات (${totalWithdrawTon.toFixed(3)} TON) يتجاوز إجمالي الإيداعات (${totalDepositTon.toFixed(3)} TON)!</b>\n` : '') +
+        (noDepositWarning   ? `\n⚠️ <b>تحذير: هذا المستخدم لم يودع ولكنه سحب!</b>\n` : '') +
+        `${'━'.repeat(30)}\n\n` +
+
+        `👥 <b>الإحالات</b>\n` +
+        `📊 إجمالي الإحالات: <b>${totalReferrals}</b>\n` +
+        `✅ إحالات نشطة: <b>${activeReferrals}</b> (أجروا معاملات)\n` +
+        `${'━'.repeat(30)}\n\n` +
+
         `📬 <b>المحافظ المستخدمة (${wallets.length})</b>\n`;
+
       wallets.slice(0, 5).forEach(w => { text += `• <code>${w}</code>\n`; });
       if (wallets.length > 5) text += `... و${wallets.length - 5} أخرى\n`;
+
       const keyboard = [];
       if (!isBanned) keyboard.push([{ text: "🚫 حظر المستخدم", callback_data: `ban_user:${userId}` }]);
-      else           keyboard.push([{ text: "✅ رفع الحظر", callback_data: `unban_user:${userId}` }]);
-      await adminReply(bot, msg.chat.id, text, { reply_markup: { inline_keyboard: keyboard } });
+      else           keyboard.push([{ text: "✅ رفع الحظر",     callback_data: `unban_user:${userId}` }]);
+
+      await adminReply(bot, msg.chat.id, text, { reply_markup: { inline_keyboard: keyboard }, disable_web_page_preview: false });
+    } catch(e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
+  });
+
+  // ─── /addcoins [userId] [amount] ─────────────────────
+  bot.onText(/\/addcoins (.+)/, async (msg, match) => {
+    if (!isAdmin(msg)) { await unauth(msg); return; }
+    const parts  = match[1].trim().split(/\s+/);
+    const userId = parts[0];
+    const amount = parseInt(parts[1]);
+    if (!userId || isNaN(amount) || amount <= 0) {
+      await adminReply(bot, msg.chat.id, `❌ الاستخدام: /addcoins [userId] [المبلغ]\nمثال: /addcoins 123456789 5000`);
+      return;
+    }
+    try {
+      const userSnap    = await db.ref(`users/${userId}`).once("value");
+      if (!userSnap.exists()) { await adminReply(bot, msg.chat.id, `❌ المستخدم <code>${userId}</code> غير موجود`); return; }
+      const userData    = userSnap.val() || {};
+      const currentCoins = Number(userData.coins || 0);
+      const newCoins     = currentCoins + amount;
+      await db.ref(`users/${userId}`).update({ coins: newCoins, updatedAt: Date.now() });
+      await adminReply(bot, msg.chat.id,
+        `✅ <b>تمت إضافة Coins بنجاح</b>\n\n` +
+        `👤 User: <code>${userId}</code>\n` +
+        `➕ مضاف: <b>${amount.toLocaleString()} Coins</b>\n` +
+        `📊 الرصيد القديم: <b>${currentCoins.toLocaleString()}</b>\n` +
+        `💰 الرصيد الجديد: <b>${newCoins.toLocaleString()} Coins</b>`
+      );
+      console.log(`✅ Admin added ${amount} coins → user ${userId} (${currentCoins} → ${newCoins})`);
+    } catch(e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
+  });
+
+  // ─── /addbamboo [userId] [amount] ────────────────────
+  bot.onText(/\/addbamboo (.+)/, async (msg, match) => {
+    if (!isAdmin(msg)) { await unauth(msg); return; }
+    const parts  = match[1].trim().split(/\s+/);
+    const userId = parts[0];
+    const amount = parseInt(parts[1]);
+    if (!userId || isNaN(amount) || amount <= 0) {
+      await adminReply(bot, msg.chat.id, `❌ الاستخدام: /addbamboo [userId] [المبلغ]\nمثال: /addbamboo 123456789 50000`);
+      return;
+    }
+    try {
+      const userSnap      = await db.ref(`users/${userId}`).once("value");
+      if (!userSnap.exists()) { await adminReply(bot, msg.chat.id, `❌ المستخدم <code>${userId}</code> غير موجود`); return; }
+      const userData      = userSnap.val() || {};
+      const currentBamboo = Number(userData.bamboo || 0);
+      const newBamboo     = currentBamboo + amount;
+      await db.ref(`users/${userId}`).update({ bamboo: newBamboo, updatedAt: Date.now() });
+      await adminReply(bot, msg.chat.id,
+        `✅ <b>تمت إضافة Bamboo بنجاح</b>\n\n` +
+        `👤 User: <code>${userId}</code>\n` +
+        `➕ مضاف: <b>${amount.toLocaleString()} 🎍 Bamboo</b>\n` +
+        `📊 الرصيد القديم: <b>${currentBamboo.toLocaleString()}</b>\n` +
+        `🎍 الرصيد الجديد: <b>${newBamboo.toLocaleString()} Bamboo</b>`
+      );
+      console.log(`✅ Admin added ${amount} bamboo → user ${userId} (${currentBamboo} → ${newBamboo})`);
     } catch(e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
   });
 
