@@ -1264,12 +1264,11 @@ function startWelcomeBot() {
     if (!isAdmin(msg)) { await unauth(msg); return; }
     const userId = match[1].trim();
     try {
-      const [bannedSnap, wdSnap, depositsSnap, referralsSnap, referralEarningsSnap, userSnap] = await Promise.all([
+      const [bannedSnap, wdSnap, depositsSnap, referralsSnap, userSnap] = await Promise.all([
         db.ref(`bannedUsers/${userId}`).once("value"),
         db.ref("withdrawQueue").orderByChild("userId").equalTo(userId).once("value"),
         db.ref(`users/${userId}/deposits`).once("value"),
         db.ref(`users/${userId}/referrals`).once("value"),
-        db.ref(`users/${userId}/referralEarnings`).once("value"),
         db.ref(`users/${userId}`).once("value"),
       ]);
 
@@ -1294,10 +1293,15 @@ function startWelcomeBot() {
       const referralsData    = referralsSnap.val() || {};
       const totalReferrals   = Object.keys(referralsData).length;
 
-      // عدد الإحالات النشطة (unique users من referralEarnings)
-      const earningsData     = referralEarningsSnap.val() || {};
-      const activeReferrers  = new Set(Object.values(earningsData).map(e => e.fromUserId).filter(Boolean));
-      const activeReferrals  = activeReferrers.size;
+      // عدد الإحالات النشطة: فحص كل مُحال مباشرة من hasDeposited
+      let activeReferrals = 0;
+      const referralIds = Object.keys(referralsData);
+      for (const referralId of referralIds) {
+        try {
+          const depSnap = await db.ref(`users/${referralId}/hasDeposited`).once("value");
+          if (depSnap.val() === true) activeReferrals++;
+        } catch (e) { /* تجاهل الأخطاء الفردية */ }
+      }
 
       // ── رصيد الكوينز والبامبو ──
       const userData   = userSnap.val() || {};
@@ -1360,7 +1364,7 @@ function startWelcomeBot() {
 
         `👥 <b>الإحالات</b>\n` +
         `📊 إجمالي الإحالات: <b>${totalReferrals}</b>\n` +
-        `✅ إحالات نشطة: <b>${activeReferrals}</b> (أجروا معاملات)\n` +
+        `✅ إحالات نشطة (أودعوا): <b>${activeReferrals}</b>\n` +
         `${'━'.repeat(30)}\n\n` +
 
         `📬 <b>المحافظ المستخدمة (${wallets.length})</b>\n`;
