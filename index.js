@@ -415,7 +415,6 @@ async function validateWithdrawal(withdrawId, data) {
     return { valid: false, skip: true };
   }
 
-
   // ── فحص الإيداع: لو المبلغ > 0.02 TON والمستخدم لم يودع → رفض فوري ──
   if (userId && roundedAmount > 0.02) {
     try {
@@ -425,28 +424,24 @@ async function validateWithdrawal(withdrawId, data) {
       if (!hasDeposited) {
         console.log(`🚫 No-deposit rejection [${withdrawId}] user=${userId} amount=${roundedAmount} TON`);
 
-        // رجّع الـ coins للمستخدم
         const coinsToRefund = Number(data.amt || 0);
         if (coinsToRefund > 0) {
           await db.ref(`users/${userId}/coins`).transaction(cur => (cur || 0) + coinsToRefund);
           console.log(`↩️ Refunded ${coinsToRefund} coins to user ${userId}`);
         }
 
-        // حدّث حالة السحب
         await db.ref(`withdrawQueue/${withdrawId}`).update({
           status:    'cancelled',
           error:     'Rejected: no deposit on record — withdrawal above 0.02 TON requires at least one prior deposit.',
           updatedAt: Date.now(),
         });
 
-        // حدّث wdHistory
         if (wdId) {
           await db.ref(`users/${userId}/wdHistory/${wdId}`).update({
             status: 'cancelled', updatedAt: Date.now(),
           }).catch(() => {});
         }
 
-        // رسالة للمستخدم
         const botToken = process.env.TELEGRAM_BOT_TOKEN;
         if (botToken && data.chatId) {
           await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
@@ -466,7 +461,6 @@ async function validateWithdrawal(withdrawId, data) {
           }).catch(() => {});
         }
 
-        // إشعار الأدمن
         if (botInstance) {
           await botInstance.sendMessage(ADMIN_CHAT_ID,
             `🚫 <b>سحب مرفوض — لا يوجد إيداع</b>\n\n` +
@@ -1688,7 +1682,6 @@ function startWelcomeBot() {
       }
     } catch (e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
   });
-
 
   // ─── /awaiting_queue ──────────────────────────────────
   bot.onText(/\/awaiting_queue/, async (msg) => {
