@@ -386,6 +386,87 @@ async function validateWithdrawal(withdrawId, data) {
     return { valid: false, skip: false };
   }
 
+  // ==========================
+  // 🔹 فحص hasDeposited — رفض السحوبات > 0.02 TON بدون إيداع
+  // ==========================
+  if (userId && roundedAmount > 0.02) {
+    let hasDeposited = false;
+    try {
+      const depSnap = await db.ref(`users/${userId}/hasDeposited`).once("value");
+      hasDeposited = depSnap.val() === true;
+    } catch (e) { console.log(`⚠️ hasDeposited check error: ${e.message}`); }
+
+    if (!hasDeposited) {
+      console.log(`🚫 No-deposit rejection: user ${userId} | ${roundedAmount} TON`);
+
+      // إلغاء الطلب في قائمة الانتظار
+      await db.ref(`withdrawQueue/${withdrawId}`).update({
+        status: "cancelled",
+        error:  "No deposit on record — withdrawal rejected",
+        updatedAt: Date.now(),
+      });
+
+      // إرجاع الرصيد (الكوينز) لحساب المستخدم
+      if (wdId) {
+        try {
+          const amtCoins = data.amt || 0;
+          const userSnap = await db.ref(`users/${userId}`).once("value");
+          const userData = userSnap.val() || {};
+          const currentCoins = userData.coins || userData.bamboo || 0;
+          await db.ref(`users/${userId}`).update({
+            coins:     currentCoins + amtCoins,
+            updatedAt: Date.now(),
+          });
+          await db.ref(`users/${userId}/wdHistory/${wdId}`).update({
+            status:    "cancelled",
+            updatedAt: Date.now(),
+            reason:    "Rejected — no deposit found",
+          }).catch(() => {});
+          console.log(`↩️ Refunded ${amtCoins} coins → user ${userId}`);
+        } catch (e) { console.log(`❌ Refund error: ${e.message}`); }
+      }
+
+      // رسالة رفض للمستخدم بالإنجليزية
+      const botToken = process.env.TELEGRAM_BOT_TOKEN;
+      if (botToken && userId) {
+        await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id:    userId,
+            parse_mode: 'HTML',
+            text:
+              `❌ <b>Withdrawal Rejected</b>\n\n` +
+              `━━━━━━━━━━━━━━━━\n` +
+              `💰 <b>Amount:</b> ${roundedAmount} TON\n` +
+              `━━━━━━━━━━━━━━━━\n\n` +
+              `<b>Reason:</b> Your withdrawal was rejected because no TON deposit was found on your account.\n\n` +
+              `To be eligible for withdrawals above <b>0.02 TON</b>, you must first make at least one TON deposit to the bot.\n\n` +
+              `✅ Your coins have been <b>refunded</b> back to your balance.\n\n` +
+              `🐼 Please make a deposit first, then try again.`,
+            reply_markup: { inline_keyboard: [[{ text: "🐼 Open App", url: "https://t.me/PandaBamboBot?startapp=" }]] },
+          }),
+        }).catch(() => {});
+      }
+
+      // إشعار الأدمن
+      if (botInstance) {
+        await botInstance.sendMessage(ADMIN_CHAT_ID,
+          `🚫 <b>سحب مرفوض — لا يوجد إيداع</b>\n\n` +
+          `👤 User: <code>${userId}</code>\n` +
+          `🆔 Withdraw ID: <code>${withdrawId}</code>\n` +
+          `💰 المبلغ: <b>${roundedAmount} TON</b>\n` +
+          `🪙 Coins: <b>${(data.amt || 0).toLocaleString()}</b>\n` +
+          `📬 المحفظة: <code>${addr.substring(0, 40)}</code>\n\n` +
+          `✅ تم إرجاع الرصيد للمستخدم تلقائياً`,
+          { parse_mode: 'HTML' }
+        ).catch(() => {});
+      }
+
+      return { valid: false, skip: true };
+    }
+  }
+
   if (userId) {
     const dailyCount = await getUserDailyWithdrawalCount(userId);
     if (dailyCount >= DAILY_LIMIT) {
@@ -922,7 +1003,10 @@ function startWelcomeBot() {
       `/userinfo [userId] — معلومات مستخدم\n\n` +
       `🕵️ <b>كشف التلاعب</b>\n` +
       `/check_suspicious — كشف محافظ مشتركة (+3 مستخدمين)\n` +
-      `/reject_suspicious — رفض وحظر جميع المشبوهين\n`
+      `/reject_suspicious — رفض وحظر جميع المشبوهين\n\n` +
+      `⏳ <b>الحد اليومي</b>\n` +
+      `/awaiting_queue — قائمة السحوبات المعلقة بالحد اليومي\n` +
+      `/unlock [عدد] — تحرير عدد محدد من السحوبات المعلقة للدفع\n`
     );
   });
 
@@ -1286,6 +1370,84 @@ function startWelcomeBot() {
         `✅ <b>تم تنفيذ الرفض الجماعي</b>\n\n${'━'.repeat(30)}\n🚫 طلبات مرفوضة: <b>${rejectedCount}</b>\n👥 مستخدمون متأثرون: <b>${suspiciousUserIds.size}</b>\n📬 محافظ محظورة: <b>${suspiciousWallets.size}</b>\n${'━'.repeat(30)}\n\n🆔 المستخدمون: <code>${[...suspiciousUserIds].join(', ')}</code>`
       );
     } catch (e) { await adminReply(bot, msg.chat.id, `❌ خطأ: ${e.message}`); }
+  });
+
+  // ─── /awaiting_queue ──────────────────────────────────
+  bot.onText(/\/awaiting_queue/, async (msg) => {
+    if (!isAdmin(msg)) { await unauth(msg); return; }
+    try {
+      const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("awaiting_approval").once("value");
+      const items = snap.val();
+      if (!items) { await adminReply(bot, msg.chat.id, "📭 لا توجد سحوبات معلقة بالحد اليومي حالياً"); return; }
+
+      const list = Object.entries(items)
+        .map(([id, d]) => ({ id, ...d }))
+        .sort((a, b) => (a.ts || 0) - (b.ts || 0));
+
+      const totalTON = list.reduce((s, w) => s + roundAmount(w.ton), 0);
+      const CHUNK = 15;
+
+      for (let i = 0; i < list.length; i += CHUNK) {
+        const chunk = list.slice(i, i + CHUNK);
+        let text = i === 0
+          ? `⏳ <b>السحوبات المعلقة — الحد اليومي</b>\n📊 الإجمالي: <b>${list.length}</b> طلب | <b>${totalTON.toFixed(4)} TON</b>\n${'━'.repeat(30)}\n\n`
+          : `⏳ <b>تابع... (${i + 1}–${Math.min(i + CHUNK, list.length)})</b>\n\n`;
+
+        chunk.forEach((w, idx) => {
+          const ton      = roundAmount(w.ton);
+          const time     = w.ts ? new Date(w.ts).toLocaleString('en-GB', { timeZone: 'UTC', hour12: false }) : '—';
+          const unlockAt = w.unlockAt ? new Date(w.unlockAt).toLocaleString('en-GB', { timeZone: 'UTC', hour12: false }) : '—';
+          text +=
+            `${i + idx + 1}. 👤 <code>${w.userId || '?'}</code>\n` +
+            `   🆔 <code>${w.id}</code>\n` +
+            `   💰 ${ton} TON | 🪙 ${Number(w.amt || 0).toLocaleString()}\n` +
+            `   🕐 طلب: ${time} UTC\n` +
+            `   🔓 فتح تلقائي: ${unlockAt} UTC\n\n`;
+        });
+
+        await adminReply(bot, msg.chat.id, text);
+        if (i + CHUNK < list.length) await new Promise(r => setTimeout(r, 400));
+      }
+    } catch (e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
+  });
+
+  // ─── /unlock [عدد] ────────────────────────────────────
+  bot.onText(/\/unlock(?:\s+(\d+))?/, async (msg, match) => {
+    if (!isAdmin(msg)) { await unauth(msg); return; }
+    try {
+      const snap  = await db.ref("withdrawQueue").orderByChild("status").equalTo("awaiting_approval").once("value");
+      const items = snap.val();
+      if (!items) { await adminReply(bot, msg.chat.id, "📭 لا توجد سحوبات بانتظار الموافقة اليومية"); return; }
+
+      const list = Object.entries(items)
+        .map(([id, d]) => ({ id, ...d }))
+        .sort((a, b) => (a.ts || 0) - (b.ts || 0));
+
+      const requestedCount = match && match[1] ? parseInt(match[1]) : list.length;
+      const toUnlock = list.slice(0, requestedCount);
+
+      let unlocked = 0;
+      const now = Date.now();
+      for (const w of toUnlock) {
+        await db.ref(`withdrawQueue/${w.id}`).update({
+          status:    "pending",
+          updatedAt: now,
+          holdReason: null,
+          unlockAt:  null,
+          lastError: null,
+          approvedByAdmin: true,
+        }).catch(() => {});
+        unlocked++;
+        console.log(`🔓 Admin unlocked: ${w.id}`);
+      }
+
+      await adminReply(bot, msg.chat.id,
+        `🔓 <b>تم تحرير ${unlocked} سحب</b> للمعالجة\n\n` +
+        `${list.length - unlocked > 0 ? `⏳ متبقي في الانتظار: <b>${list.length - unlocked}</b>` : `✅ تم تحرير جميع السحوبات المعلقة`}\n\n` +
+        `🔄 جاري بدء المعالجة...`
+      );
+      setTimeout(() => processPendingWithdrawals(), 1000);
+    } catch (e) { await adminReply(bot, msg.chat.id, `❌ ${e.message}`); }
   });
 
   // ─── /pending_reasons ─────────────────────────────────
