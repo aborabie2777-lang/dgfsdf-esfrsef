@@ -496,7 +496,7 @@ async function validateWithdrawal(withdrawId, data) {
   // ==========================
   // 🔹 فحص: إجمالي السحوبات > إجمالي الإيداعات → موافقة أدمن
   // ==========================
-  if (userId && data.status !== 'awaiting_approval') {
+  if (userId && data.status !== 'awaiting_approval' && !data.approvedByAdmin) {
     try {
       const [depositsSnap, paidWdSnap] = await Promise.all([
         db.ref(`users/${userId}/deposits`).once("value"),
