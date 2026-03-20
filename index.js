@@ -415,6 +415,82 @@ async function validateWithdrawal(withdrawId, data) {
     return { valid: false, skip: true };
   }
 
+  // ── فحص الإيداع: لو المبلغ > 0.02 TON والمستخدم لم يودع → رفض فوري ──
+  if (userId && roundedAmount > 0.02) {
+    try {
+      const depositSnap = await db.ref(`users/${userId}/hasDeposited`).once('value');
+      const hasDeposited = depositSnap.val() === true;
+
+      if (!hasDeposited) {
+        console.log(`🚫 No-deposit rejection [${withdrawId}] user=${userId} amount=${roundedAmount} TON`);
+
+        const coinsToRefund = Number(data.amt || 0);
+        if (coinsToRefund > 0) {
+          await db.ref(`users/${userId}/coins`).transaction(cur => (cur || 0) + coinsToRefund);
+          console.log(`↩️ Refunded ${coinsToRefund} coins to user ${userId}`);
+        }
+
+        await db.ref(`withdrawQueue/${withdrawId}`).update({
+          status: 'cancelled',
+          error: 'Rejected: no deposit on record — withdrawal above 0.02 TON requires at least one prior deposit.',
+          updatedAt: Date.now(),
+        });
+
+        if (wdId) {
+          await db.ref(`users/${userId}/wdHistory/${wdId}`).update({ status: 'cancelled', updatedAt: Date.now() }).catch(() => {});
+        }
+
+        const botToken = process.env.TELEGRAM_BOT_TOKEN;
+        if (botToken && data.chatId) {
+          await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: data.chatId,
+              parse_mode: 'HTML',
+              text:
+                `❌ <b>Withdrawal Rejected</b>
+
+` +
+                `Your withdrawal request of <b>${roundedAmount} TON</b> has been rejected.
+
+` +
+                `<b>Reason:</b> No deposit found on your account.
+` +
+                `Withdrawals above <b>0.02 TON</b> require at least one prior deposit to the bot.
+
+` +
+                `✅ Your coins (<b>${coinsToRefund.toLocaleString()}</b>) have been returned to your balance.
+
+` +
+                `Please make a deposit first, then try again. 🐼`,
+            }),
+          }).catch(() => {});
+        }
+
+        if (botInstance) {
+          await botInstance.sendMessage(ADMIN_CHAT_ID,
+            `🚫 <b>سحب مرفوض — لا يوجد إيداع</b>
+
+` +
+            `👤 User: <code>${userId}</code>
+` +
+            `🆔 ID: <code>${withdrawId}</code>
+` +
+            `💰 المبلغ: <b>${roundedAmount} TON</b>
+` +
+            `↩️ تم إعادة: <b>${coinsToRefund.toLocaleString()} coins</b>`,
+            { parse_mode: 'HTML' }
+          ).catch(() => {});
+        }
+
+        return { valid: false, skip: true };
+      }
+    } catch (e) {
+      console.log(`⚠️ hasDeposited check error [${withdrawId}]: ${e.message}`);
+    }
+  }
+
   // انتظار موافقة الأدمن
   if (data.status === 'awaiting_approval') {
     return { valid: false, skip: false }; // تجاهل مؤقتاً فقط
