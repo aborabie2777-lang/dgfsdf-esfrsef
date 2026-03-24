@@ -41,7 +41,7 @@ let SINGLE_DELAY_MS       = 3000;
 let MAX_WITHDRAWAL_AMOUNT = 10;
 let MIN_WITHDRAWAL_AMOUNT = 0.5;
 let MAX_BALANCE_BUFFER    = 0.1;
-let BAMBOO_TO_TON_RATE    = 10000;
+let BAMBOO_TO_TON_RATE    = 50000;
 let DAILY_LIMIT           = 2;
 let DAILY_COOLDOWN_HOURS  = 24;
 let systemPaused          = false;
@@ -386,31 +386,7 @@ async function validateWithdrawal(withdrawId, data) {
     return { valid: false, skip: false };
   }
 
-  if (roundedAmount < 0.1) {
-    console.log(`🚫 Min 0.1 TON rejection: user ${userId} | ${roundedAmount} TON`);
-    await db.ref(`withdrawQueue/${withdrawId}`).update({
-      status: "cancelled",
-      error:  "Below minimum 0.1 TON — withdrawal rejected",
-      updatedAt: Date.now(),
-    });
-    if (userId && wdId) {
-      try {
-        const amtCoins = data.amt || 0;
-        const userSnap = await db.ref(`users/${userId}`).once("value");
-        const userData = userSnap.val() || {};
-        const currentCoins = userData.coins || userData.bamboo || 0;
-        await db.ref(`users/${userId}`).update({ coins: currentCoins + amtCoins, updatedAt: Date.now() });
-        await db.ref(`users/${userId}/wdHistory/${wdId}`).update({ status: "cancelled", updatedAt: Date.now(), reason: "Below min 0.1 TON" }).catch(() => {});
-      } catch (e) { console.log(`❌ Refund error (min check): ${e.message}`); }
-    }
-    if (botInstance) {
-      await botInstance.sendMessage(ADMIN_CHAT_ID,
-        `🚫 <b>سحب مرفوض — أقل من 0.1 TON</b>\n\n👤 User: <code>${userId}</code>\n💰 المبلغ: <b>${roundedAmount} TON</b>`,
-        { parse_mode: 'HTML' }
-      ).catch(() => {});
-    }
-    return { valid: false, skip: true };
-  }
+  // ملاحظة: تم إلغاء قيد الرفض لأقل من 0.1 TON — السحوبات الصغيرة تُعالج عبر فحص الإيداعات
 
   // ==========================
   // 🔹 فحص الإيداعات الموحد — يغطي كل الحالات
@@ -438,6 +414,11 @@ async function validateWithdrawal(withdrawId, data) {
       console.log(`🔍 Deposit check [${userId}]: deposited=${totalDepositTon.toFixed(3)} paidSoFar=${totalPaidTon.toFixed(3)} thisWd=${roundedAmount} projected=${projectedTotal.toFixed(3)}`);
 
       if (projectedTotal > totalDepositTon) {
+        // المستخدم المجاني (لم يودع) — السماح بسحب حتى 0.1 TON تلقائياً
+        if (totalDepositTon === 0 && roundedAmount <= 0.1) {
+          console.log(`✅ Free user withdrawal allowed (≤0.1 TON): user ${userId} | ${roundedAmount} TON`);
+          // نكمل المعالجة بشكل طبيعي
+        } else {
         await db.ref(`withdrawQueue/${withdrawId}`).update({
           status:    "awaiting_approval",
           updatedAt: Date.now(),
@@ -482,6 +463,7 @@ async function validateWithdrawal(withdrawId, data) {
           else console.log(`❌ Deposit alert failed: ${JSON.stringify(resData)}`);
         }
         return { valid: false, skip: false };
+        } // end else (not free user ≤0.1 TON)
       }
       console.log(`✅ Deposit check passed for ${userId}`);
     } catch (e) { console.log(`⚠️ Deposit check error: ${e.message}`); }
@@ -868,8 +850,8 @@ async function checkDeposits() {
       } catch(e) {}
       if (!userData) continue;
 
-      // حساب البامبو (1 TON = 10,000 Bamboo)
-      const bambooEarned     = Math.floor(amountTon * 10000);
+      // حساب البامبو (1 TON = 50,000 Bamboo)
+      const bambooEarned     = Math.floor(amountTon * 50000);
       const currentBamboo    = userData.bamboo || 0;
       const newBambooBalance = currentBamboo + bambooEarned;
 
